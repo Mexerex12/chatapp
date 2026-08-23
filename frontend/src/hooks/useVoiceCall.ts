@@ -223,6 +223,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         );
         const isFallbackScreenTrack = track.kind === "video" && remoteScreenSharersRef.current.has(peerUserId) && entry.screenStream.getVideoTracks().length === 0;
         if (isScreenTrack || isFallbackScreenTrack) {
+        if (isScreenTrack) {
           const screenStream = stream ?? entry.screenStream;
           if (!stream && !screenStream.getTrackById(track.id)) screenStream.addTrack(track);
           updateParticipant(peerUserId, {
@@ -367,6 +368,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
             noiseSuppression: true,
             autoGainControl: true,
           },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
           video: false,
         });
         localStreamRef.current = stream;
@@ -399,6 +401,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       });
     },
     [socket, createOutboundAudioTrack, createPeerConnection, refreshAudioDevices, selectedAudioInputId, startSpeakingDetector, stopSpeakingDetector]
+    [socket, createOutboundAudioTrack, createPeerConnection, refreshAudioDevices, startSpeakingDetector, stopSpeakingDetector]
   );
 
   const selectAudioInput = useCallback(async (deviceId: string) => {
@@ -622,6 +625,9 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     // synchronously run a browser's `ended` handler, which otherwise causes a
     // second stop operation against a newly-created share.
     screenStreamRef.current = null;
+
+    screenStream?.getTracks().forEach((track) => track.stop());
+
 
     screenStream?.getTracks().forEach((track) => track.stop());
 

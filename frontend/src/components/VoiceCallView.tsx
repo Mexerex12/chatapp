@@ -89,6 +89,9 @@ export function VoiceCallView({
   useEffect(() => {
     localStorage.setItem(`chatapp:voice-output:${user?.id ?? "anonymous"}`, JSON.stringify({ muted: outputMuted, volume: outputVolume }));
   }, [outputMuted, outputVolume, user?.id]);
+  const [outputMuted, setOutputMuted] = useState(false);
+  const [outputVolume, setOutputVolume] = useState(100);
+  const audioLevel = outputMuted ? 0 : outputVolume / 100;
 
   return (
     <div className="flex-1 flex flex-col bg-bg-secondary min-w-0 h-full">
