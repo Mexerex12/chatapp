@@ -96,6 +96,7 @@ export function VoiceCallView({
 
       {audioPanelOpen && (
         <section className="grid gap-4 px-5 py-4 border-b border-white/5 bg-bg-primary/40 animate-fade-in md:grid-cols-2" aria-label="Configurações de áudio">
+        <section className="flex flex-wrap items-center gap-x-5 gap-y-3 px-5 py-3 border-b border-white/5 bg-bg-primary/40 animate-fade-in" aria-label="Configurações de áudio">
           <div className="flex items-center gap-2 text-sm text-text-primary">
             <Headphones size={16} className="text-text-muted" />
             <span className="font-medium">Áudio da chamada</span>
@@ -109,6 +110,7 @@ export function VoiceCallView({
             {outputMuted ? "Áudio desativado" : "Áudio ativado"}
           </button>
           <label className="flex items-center gap-3 text-xs text-text-muted min-w-[230px]">
+          <label className="flex items-center gap-3 text-xs text-text-muted min-w-[230px] flex-1 max-w-sm">
             <span>Volume</span>
             <input
               type="range"

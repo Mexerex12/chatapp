@@ -355,6 +355,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       });
     },
     [socket, createOutboundAudioTrack, createPeerConnection, refreshAudioDevices, startSpeakingDetector, stopSpeakingDetector]
+    [socket, createPeerConnection, refreshAudioDevices, startSpeakingDetector, stopSpeakingDetector]
   );
 
   const selectAudioInput = useCallback(async (deviceId: string) => {
@@ -383,6 +384,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       currentStream?.addTrack(nextTrack);
       const outboundTrack = createOutboundAudioTrack(nextTrack, screenStreamRef.current?.getAudioTracks()[0]);
       await replaceOutboundAudioTrack(outboundTrack);
+      for (const entry of peersRef.current.values()) await entry.audioTransceiver.sender.replaceTrack(nextTrack);
       stopSpeakingDetector();
       startSpeakingDetector(stream, chId);
       setSelectedAudioInputId(deviceId);
@@ -391,6 +393,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       setError("Não foi possível trocar o microfone. Verifique as permissões do dispositivo.");
     }
   }, [createOutboundAudioTrack, micMuted, replaceOutboundAudioTrack, selectedAudioInputId, startSpeakingDetector, stopSpeakingDetector]);
+  }, [micMuted, selectedAudioInputId, startSpeakingDetector, stopSpeakingDetector]);
 
   const leave = useCallback(() => {
     const chId = channelIdRef.current;
@@ -582,6 +585,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     setScreenSharing(false);
     if (chId) socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
   }, [createOutboundAudioTrack, replaceOutboundAudioTrack, socket]);
+  }, [socket]);
 
   const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
