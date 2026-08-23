@@ -13,6 +13,11 @@ export interface VoiceParticipant {
   screenStream?: MediaStream;
 }
 
+export interface AudioDeviceOption {
+  deviceId: string;
+  label: string;
+}
+
 interface PeerEntry {
   pc: RTCPeerConnection;
   audioTransceiver: RTCRtpTransceiver;
@@ -35,6 +40,10 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
   const [screenSharing, setScreenSharing] = useState(false);
   const [localSpeaking, setLocalSpeaking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [audioInputs, setAudioInputs] = useState<AudioDeviceOption[]>([]);
+  const [audioOutputs, setAudioOutputs] = useState<AudioDeviceOption[]>([]);
+  const [selectedAudioInputId, setSelectedAudioInputId] = useState("");
+  const [selectedAudioOutputId, setSelectedAudioOutputId] = useState("");
 
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -52,6 +61,23 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       })
       .catch(() => {});
   }, []);
+
+  const refreshAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const toOption = (device: MediaDeviceInfo, index: number) => ({
+      deviceId: device.deviceId,
+      label: device.label || `${device.kind === "audioinput" ? "Microfone" : "Saída de áudio"} ${index + 1}`,
+    });
+    setAudioInputs(devices.filter((device) => device.kind === "audioinput").map(toOption));
+    setAudioOutputs(devices.filter((device) => device.kind === "audiooutput").map(toOption));
+  }, []);
+
+  useEffect(() => {
+    void refreshAudioDevices();
+    navigator.mediaDevices?.addEventListener("devicechange", refreshAudioDevices);
+    return () => navigator.mediaDevices?.removeEventListener("devicechange", refreshAudioDevices);
+  }, [refreshAudioDevices]);
 
   const updateParticipant = useCallback((userId: string, patch: Partial<VoiceParticipant>) => {
     setParticipants((prev) => ({
@@ -262,9 +288,13 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     async (chId: string) => {
       setError(null);
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        });
         localStreamRef.current = stream;
         startSpeakingDetector(stream, chId);
+        void refreshAudioDevices();
       } catch {
         setError("Não foi possível acessar o microfone. Verifique as permissões.");
         return;
@@ -288,8 +318,42 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         }
       });
     },
-    [socket, createPeerConnection, startSpeakingDetector, stopSpeakingDetector]
+    [socket, createPeerConnection, refreshAudioDevices, startSpeakingDetector, stopSpeakingDetector]
   );
+
+  const selectAudioInput = useCallback(async (deviceId: string) => {
+    const chId = channelIdRef.current;
+    if (!chId || deviceId === selectedAudioInputId) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      const nextTrack = stream.getAudioTracks()[0];
+      if (!nextTrack) throw new Error("Microfone não disponível");
+
+      nextTrack.enabled = !micMuted;
+      const currentStream = localStreamRef.current;
+      currentStream?.getAudioTracks().forEach((track) => {
+        currentStream.removeTrack(track);
+        track.stop();
+      });
+      currentStream?.addTrack(nextTrack);
+      for (const entry of peersRef.current.values()) await entry.audioTransceiver.sender.replaceTrack(nextTrack);
+      stopSpeakingDetector();
+      startSpeakingDetector(stream, chId);
+      setSelectedAudioInputId(deviceId);
+      setError(null);
+    } catch {
+      setError("Não foi possível trocar o microfone. Verifique as permissões do dispositivo.");
+    }
+  }, [micMuted, selectedAudioInputId, startSpeakingDetector, stopSpeakingDetector]);
 
   const leave = useCallback(() => {
     const chId = channelIdRef.current;
@@ -460,18 +524,20 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
 
   const stopScreenShare = useCallback(async () => {
     const chId = channelIdRef.current;
-    if (!chId) return;
+    const screenStream = screenStreamRef.current;
+    // Clear the reference before stopping the track. Calling track.stop() can
+    // synchronously run a browser's `ended` handler, which otherwise causes a
+    // second stop operation against a newly-created share.
+    screenStreamRef.current = null;
 
-    const track = screenStreamRef.current?.getVideoTracks()[0];
-    if (track) track.stop();
+    screenStream?.getTracks().forEach((track) => track.stop());
 
     for (const entry of peersRef.current.values()) {
       await entry.screenTransceiver.sender.replaceTrack(null);
     }
 
-    screenStreamRef.current = null;
     setScreenSharing(false);
-    socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
+    if (chId) socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
   }, [socket]);
 
   const toggleScreenShare = useCallback(async () => {
@@ -489,6 +555,10 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         audio: false,
       });
       const track = display.getVideoTracks()[0];
+      if (!track) {
+        display.getTracks().forEach((mediaTrack) => mediaTrack.stop());
+        throw new Error("Nenhuma tela foi selecionada");
+      }
       track.contentHint = "detail";
       screenStreamRef.current = display;
 
@@ -523,5 +593,12 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     toggleScreenShare,
     error,
     localStream: localStreamRef,
+    localScreenStream: screenStreamRef,
+    audioInputs,
+    audioOutputs,
+    selectedAudioInputId,
+    selectedAudioOutputId,
+    selectAudioInput,
+    setSelectedAudioOutputId,
   };
 }

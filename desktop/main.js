@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, systemPreferences, session } = require("electron");
+const { app, BrowserWindow, desktopCapturer, systemPreferences, session } = require("electron");
 const path = require("path");
 
 // URL do frontend: em desenvolvimento aponta para o Vite dev server.
@@ -32,6 +32,18 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // getDisplayMedia needs a capture source in Electron in addition to the
+  // regular permission grant below. Without this handler, the renderer's
+  // screen-share picker is rejected before a MediaStream can be created.
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    try {
+      const sources = await desktopCapturer.getSources({ types: ["screen"] });
+      callback({ video: sources[0] });
+    } catch {
+      callback({});
+    }
+  });
+
   // No macOS, solicita permissão explícita do SO para microfone/câmera.
   if (process.platform === "darwin") {
     systemPreferences.askForMediaAccess("microphone").catch(() => {});
