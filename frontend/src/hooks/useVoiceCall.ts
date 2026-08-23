@@ -51,6 +51,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
   const [selectedAudioInputId, setSelectedAudioInputId] = useState("");
   const [selectedAudioOutputId, setSelectedAudioOutputId] = useState("");
   const [microphoneGain, setMicrophoneGain] = useState(200);
+  const [audioPreferencesReadyForUser, setAudioPreferencesReadyForUser] = useState<string | null>(null);
 
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -58,6 +59,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
   const iceServersRef = useRef<RTCIceServer[]>([{ urls: "stun:stun.l.google.com:19302" }]);
   const analyserRef = useRef<{ ctx: AudioContext; raf: number } | null>(null);
   const outboundAudioProcessorRef = useRef<OutboundAudioProcessor | null>(null);
+  const remoteScreenSharersRef = useRef<Set<string>>(new Set());
   const channelIdRef = useRef<string | null>(channelId);
   channelIdRef.current = channelId;
 
@@ -69,6 +71,29 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!myUserId) return;
+    setAudioPreferencesReadyForUser(null);
+    try {
+      const saved = JSON.parse(localStorage.getItem(`chatapp:voice-audio:${myUserId}`) ?? "{}");
+      setSelectedAudioInputId(typeof saved.inputId === "string" ? saved.inputId : "");
+      setSelectedAudioOutputId(typeof saved.outputId === "string" ? saved.outputId : "");
+      setMicrophoneGain(typeof saved.microphoneGain === "number" ? Math.min(200, Math.max(100, saved.microphoneGain)) : 200);
+    } catch {
+      // Storage may be unavailable or contain an old invalid value.
+    }
+    setAudioPreferencesReadyForUser(myUserId);
+  }, [myUserId]);
+
+  useEffect(() => {
+    if (!myUserId || audioPreferencesReadyForUser !== myUserId) return;
+    localStorage.setItem(`chatapp:voice-audio:${myUserId}`, JSON.stringify({
+      inputId: selectedAudioInputId,
+      outputId: selectedAudioOutputId,
+      microphoneGain,
+    }));
+  }, [audioPreferencesReadyForUser, microphoneGain, myUserId, selectedAudioInputId, selectedAudioOutputId]);
 
   const refreshAudioDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -196,6 +221,8 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         const isScreenTrack = event.transceiver === entry.screenTransceiver || (
           event.transceiver.mid !== null && event.transceiver.mid === entry.screenTransceiver.mid
         );
+        const isFallbackScreenTrack = track.kind === "video" && remoteScreenSharersRef.current.has(peerUserId) && entry.screenStream.getVideoTracks().length === 0;
+        if (isScreenTrack || isFallbackScreenTrack) {
         if (isScreenTrack) {
           const screenStream = stream ?? entry.screenStream;
           if (!stream && !screenStream.getTrackById(track.id)) screenStream.addTrack(track);
@@ -283,6 +310,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     const entry = peersRef.current.get(peerUserId);
     entry?.pc.close();
     peersRef.current.delete(peerUserId);
+    remoteScreenSharersRef.current.delete(peerUserId);
     setParticipants((prev) => {
       const next = { ...prev };
       delete next[peerUserId];
@@ -334,6 +362,12 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       setError(null);
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: selectedAudioInputId ? { exact: selectedAudioInputId } : undefined,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
           video: false,
         });
@@ -366,6 +400,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         }
       });
     },
+    [socket, createOutboundAudioTrack, createPeerConnection, refreshAudioDevices, selectedAudioInputId, startSpeakingDetector, stopSpeakingDetector]
     [socket, createOutboundAudioTrack, createPeerConnection, refreshAudioDevices, startSpeakingDetector, stopSpeakingDetector]
   );
 
@@ -416,6 +451,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     if (chId) socket?.emit("voice:leave", chId);
     for (const [, entry] of peersRef.current) entry.pc.close();
     peersRef.current.clear();
+    remoteScreenSharersRef.current.clear();
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     outboundAudioProcessorRef.current?.ctx.close().catch(() => {});
@@ -506,6 +542,8 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     }
 
     function onScreenshareUpdate(data: { userId: string; sharing: boolean }) {
+      if (data.sharing) remoteScreenSharersRef.current.add(data.userId);
+      else remoteScreenSharersRef.current.delete(data.userId);
       updateParticipant(data.userId, { sharingScreen: data.sharing });
       if (!data.sharing) {
         updateParticipant(data.userId, { screenStream: undefined });
@@ -587,6 +625,9 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     // synchronously run a browser's `ended` handler, which otherwise causes a
     // second stop operation against a newly-created share.
     screenStreamRef.current = null;
+
+    screenStream?.getTracks().forEach((track) => track.stop());
+
 
     screenStream?.getTracks().forEach((track) => track.stop());
 

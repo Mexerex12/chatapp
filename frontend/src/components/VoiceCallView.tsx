@@ -69,6 +69,26 @@ export function VoiceCallView({
   const tileCount = list.length + 1;
   const cols = tileCount <= 1 ? 1 : tileCount <= 4 ? 2 : tileCount <= 9 ? 3 : 4;
   const [audioPanelOpen, setAudioPanelOpen] = useState(false);
+  const [outputMuted, setOutputMuted] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(`chatapp:voice-output:${user?.id ?? "anonymous"}`) ?? "{}").muted === true;
+    } catch {
+      return false;
+    }
+  });
+  const [outputVolume, setOutputVolume] = useState(() => {
+    try {
+      const volume = JSON.parse(localStorage.getItem(`chatapp:voice-output:${user?.id ?? "anonymous"}`) ?? "{}").volume;
+      return typeof volume === "number" ? Math.min(100, Math.max(0, volume)) : 100;
+    } catch {
+      return 100;
+    }
+  });
+  const audioLevel = outputMuted ? 0 : outputVolume / 100;
+
+  useEffect(() => {
+    localStorage.setItem(`chatapp:voice-output:${user?.id ?? "anonymous"}`, JSON.stringify({ muted: outputMuted, volume: outputVolume }));
+  }, [outputMuted, outputVolume, user?.id]);
   const [outputMuted, setOutputMuted] = useState(false);
   const [outputVolume, setOutputVolume] = useState(100);
   const audioLevel = outputMuted ? 0 : outputVolume / 100;
