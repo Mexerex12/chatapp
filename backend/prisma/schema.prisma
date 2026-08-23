@@ -1,0 +1,143 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum ChannelType {
+  TEXT
+  VOICE
+}
+
+enum FriendRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+model User {
+  id            String   @id @default(cuid())
+  username      String   @unique
+  email         String   @unique
+  passwordHash  String
+  avatarColor   String   @default("#5865F2")
+  avatarUrl     String?
+  status        String   @default("offline") // online | offline | idle
+  createdAt     DateTime @default(now())
+
+  memberships       ServerMember[]
+  messages          Message[]
+  ownedServers      Server[]         @relation("ServerOwner")
+  sentInvites       Invite[]
+  sentRequests      FriendRequest[]  @relation("SentRequests")
+  receivedRequests  FriendRequest[]  @relation("ReceivedRequests")
+  friendsA          Friend[]         @relation("FriendA")
+  friendsB          Friend[]         @relation("FriendB")
+}
+
+model Server {
+  id        String   @id @default(cuid())
+  name      String
+  iconUrl   String?
+  ownerId   String
+  owner     User     @relation("ServerOwner", fields: [ownerId], references: [id])
+  createdAt DateTime @default(now())
+
+  members  ServerMember[]
+  channels Channel[]
+  invites  Invite[]
+
+  @@index([ownerId])
+}
+
+model ServerMember {
+  id       String @id @default(cuid())
+  userId   String
+  serverId String
+  role     Role   @default(MEMBER)
+  joinedAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, serverId])
+  @@index([serverId])
+}
+
+model Channel {
+  id       String      @id @default(cuid())
+  name     String
+  type     ChannelType
+  serverId String
+  position Int         @default(0)
+  createdAt DateTime   @default(now())
+
+  server   Server    @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([serverId])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  content   String
+  channelId String
+  authorId  String
+  createdAt DateTime @default(now())
+  editedAt  DateTime?
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, createdAt])
+}
+
+model Invite {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  serverId  String
+  createdBy String
+  expiresAt DateTime?
+  maxUses   Int?
+  uses      Int      @default(0)
+  createdAt DateTime @default(now())
+
+  server  Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  creator User   @relation(fields: [createdBy], references: [id])
+
+  @@index([serverId])
+}
+
+model FriendRequest {
+  id         String               @id @default(cuid())
+  senderId   String
+  receiverId String
+  status     FriendRequestStatus  @default(PENDING)
+  createdAt  DateTime             @default(now())
+
+  sender   User @relation("SentRequests", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver User @relation("ReceivedRequests", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@unique([senderId, receiverId])
+}
+
+model Friend {
+  id        String   @id @default(cuid())
+  userAId   String
+  userBId   String
+  createdAt DateTime @default(now())
+
+  userA User @relation("FriendA", fields: [userAId], references: [id], onDelete: Cascade)
+  userB User @relation("FriendB", fields: [userBId], references: [id], onDelete: Cascade)
+
+  @@unique([userAId, userBId])
+}

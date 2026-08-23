@@ -1,0 +1,12 @@
+{
+  "name": "chatapp",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Monorepo do ChatApp (backend + frontend + desktop)",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install && cd ../desktop && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:desktop": "cd desktop && npm start"
+  }
+}
