@@ -214,13 +214,6 @@ export default function HomePage() {
               onToggleScreenShare={call.toggleScreenShare}
               onLeave={() => setActiveChannel(null)}
               localVideoStream={call.localStream.current}
-              localScreenStream={call.localScreenStream.current}
-              audioInputs={call.audioInputs}
-              audioOutputs={call.audioOutputs}
-              selectedAudioInputId={call.selectedAudioInputId}
-              selectedAudioOutputId={call.selectedAudioOutputId}
-              onSelectAudioInput={call.selectAudioInput}
-              onSelectAudioOutput={call.setSelectedAudioOutputId}
             />
           ) : activeChannel ? (
             <ChatArea channel={activeChannel} socket={socket} />
