@@ -9,19 +9,23 @@ export interface VoiceParticipant {
   videoEnabled: boolean;
   sharingScreen: boolean;
   speaking: boolean;
-  stream?: MediaStream; // stream de câmera/microfone remoto
-  screenStream?: MediaStream; // stream de compartilhamento de tela remoto
+  stream?: MediaStream;
+  screenStream?: MediaStream;
 }
 
 interface PeerEntry {
   pc: RTCPeerConnection;
-  cameraStream?: MediaStream;
-  screenShareStream?: MediaStream;
+  audioTransceiver: RTCRtpTransceiver;
+  cameraTransceiver: RTCRtpTransceiver;
+  screenTransceiver: RTCRtpTransceiver;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+  pendingCandidates: RTCIceCandidateInit[];
+  polite: boolean;
+  cameraStream: MediaStream;
+  screenStream: MediaStream;
 }
-
-// Cada participante remoto pode nos enviar até 2 "video tracks" (câmera e tela).
-// Para diferenciar no ontrack, usamos o msid/transceiver "kind"+ordem: track de
-// tela é identificada pela track.label/contentHint que setamos como "screen".
 
 export function useVoiceCall(socket: Socket | null, channelId: string | null, _username: string, myUserId: string) {
   const [connected, setConnected] = useState(false);
@@ -52,46 +56,157 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
   const updateParticipant = useCallback((userId: string, patch: Partial<VoiceParticipant>) => {
     setParticipants((prev) => ({
       ...prev,
-      [userId]: { ...(prev[userId] ?? { userId, username: userId, muted: false, videoEnabled: false, sharingScreen: false, speaking: false }), ...patch },
+      [userId]: {
+        ...(prev[userId] ?? {
+          userId,
+          username: userId,
+          muted: false,
+          videoEnabled: false,
+          sharingScreen: false,
+          speaking: false,
+        }),
+        ...patch,
+      },
     }));
   }, []);
 
+  const emitSignal = useCallback(
+    (peerUserId: string, type: string, payload: unknown, chId: string) => {
+      socket?.emit("voice:signal", {
+        to: peerUserId,
+        from: myUserId,
+        type,
+        payload,
+        channelId: chId,
+      });
+    },
+    [socket, myUserId]
+  );
+
   const createPeerConnection = useCallback(
     (peerUserId: string, chId: string): RTCPeerConnection => {
-      const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
+      const existing = peersRef.current.get(peerUserId);
+      if (existing) return existing.pc;
 
-      const local = localStreamRef.current;
-      if (local) {
-        for (const track of local.getTracks()) pc.addTrack(track, local);
-      }
-      if (screenStreamRef.current) {
-        for (const track of screenStreamRef.current.getTracks()) pc.addTrack(track, screenStreamRef.current);
-      }
+      const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
+      const polite = myUserId.localeCompare(peerUserId) > 0;
+
+      // Reserve the media sections from the first offer. This is the key to making
+      // camera/screen-share toggles work without adding new m-lines later.
+      const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
+      const cameraTransceiver = pc.addTransceiver("video", { direction: "sendrecv" });
+      const screenTransceiver = pc.addTransceiver("video", { direction: "sendrecv" });
+
+      const entry: PeerEntry = {
+        pc,
+        audioTransceiver,
+        cameraTransceiver,
+        screenTransceiver,
+        makingOffer: false,
+        ignoreOffer: false,
+        isSettingRemoteAnswerPending: false,
+        pendingCandidates: [],
+        polite,
+        cameraStream: new MediaStream(),
+        screenStream: new MediaStream(),
+      };
+
+      const localAudio = localStreamRef.current?.getAudioTracks()[0];
+      const localCamera = localStreamRef.current?.getVideoTracks()[0];
+      const localScreen = screenStreamRef.current?.getVideoTracks()[0];
+
+      void audioTransceiver.sender.replaceTrack(localAudio ?? null);
+      void cameraTransceiver.sender.replaceTrack(localCamera ?? null);
+      void screenTransceiver.sender.replaceTrack(localScreen ?? null);
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          socket?.emit("voice:signal", { to: peerUserId, from: myUserId, type: "ice-candidate", payload: event.candidate, channelId: chId });
+          emitSignal(peerUserId, "ice-candidate", event.candidate.toJSON(), chId);
         }
       };
 
       pc.ontrack = (event) => {
+        const track = event.track;
         const stream = event.streams[0];
-        const isScreen = stream?.id.startsWith("screen-") || event.track.contentHint === "detail";
-        updateParticipant(peerUserId, isScreen ? { screenStream: stream, sharingScreen: true } : { stream });
-      };
 
-      pc.onconnectionstatechange = () => {
-        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
-          // conexão caiu — o evento voice:user-left do servidor cuida da limpeza,
-          // mas garantimos que não fique um peer "morto" pendurado.
+        if (event.transceiver.mid && event.transceiver.mid === entry.screenTransceiver.mid) {
+          if (!entry.screenStream.getTrackById(track.id)) entry.screenStream.addTrack(track);
+          updateParticipant(peerUserId, {
+            screenStream: entry.screenStream,
+            sharingScreen: true,
+          });
+          track.onended = () => {
+            entry.screenStream.removeTrack(track);
+            updateParticipant(peerUserId, {
+              screenStream: entry.screenStream.getVideoTracks().length ? entry.screenStream : undefined,
+              sharingScreen: entry.screenStream.getVideoTracks().length > 0,
+            });
+          };
+          return;
+        }
+
+        if (event.transceiver.mid && event.transceiver.mid === entry.cameraTransceiver.mid) {
+          if (stream) {
+            updateParticipant(peerUserId, { stream });
+          } else {
+            if (!entry.cameraStream.getTrackById(track.id)) entry.cameraStream.addTrack(track);
+            updateParticipant(peerUserId, { stream: entry.cameraStream });
+          }
+          return;
+        }
+
+        // Audio has no visual representation, but it must remain attached to a
+        // stream so VoiceCallView can play it.
+        if (stream) {
+          updateParticipant(peerUserId, { stream });
+        } else {
+          if (!entry.cameraStream.getTrackById(track.id)) entry.cameraStream.addTrack(track);
+          updateParticipant(peerUserId, { stream: entry.cameraStream });
         }
       };
 
-      peersRef.current.set(peerUserId, { pc });
+      pc.onnegotiationneeded = async () => {
+        try {
+          entry.makingOffer = true;
+          const offer = await pc.createOffer();
+          if (pc.signalingState !== "stable") return;
+          await pc.setLocalDescription(offer);
+          emitSignal(peerUserId, "offer", pc.localDescription, chId);
+        } catch (err) {
+          console.error("WebRTC negotiation failed", err);
+        } finally {
+          entry.makingOffer = false;
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "failed") {
+          void pc.restartIce();
+        }
+      };
+
+      peersRef.current.set(peerUserId, entry);
       return pc;
     },
-    [socket, myUserId, updateParticipant]
+    [emitSignal, myUserId, updateParticipant]
   );
+
+  const renegotiatePeer = useCallback(async (peerUserId: string) => {
+    const entry = peersRef.current.get(peerUserId);
+    if (!entry || entry.pc.signalingState !== "stable") return;
+
+    try {
+      entry.makingOffer = true;
+      const offer = await entry.pc.createOffer();
+      await entry.pc.setLocalDescription(offer);
+      const chId = channelIdRef.current;
+      if (chId) emitSignal(peerUserId, "offer", entry.pc.localDescription, chId);
+    } catch (err) {
+      console.error("WebRTC renegotiation failed", err);
+    } finally {
+      entry.makingOffer = false;
+    }
+  }, [emitSignal]);
 
   const removePeer = useCallback((peerUserId: string) => {
     const entry = peersRef.current.get(peerUserId);
@@ -127,7 +242,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
           setLocalSpeaking(speaking);
           socket?.emit("voice:speaking", { channelId: chId, speaking });
         }
-        analyserRef.current!.raf = requestAnimationFrame(tick);
+        if (analyserRef.current) analyserRef.current.raf = requestAnimationFrame(tick);
       }
       analyserRef.current = { ctx, raf: requestAnimationFrame(tick) };
     },
@@ -140,6 +255,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       analyserRef.current.ctx.close().catch(() => {});
       analyserRef.current = null;
     }
+    setLocalSpeaking(false);
   }, []);
 
   const join = useCallback(
@@ -149,27 +265,30 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
         localStreamRef.current = stream;
         startSpeakingDetector(stream, chId);
-      } catch (e) {
+      } catch {
         setError("Não foi possível acessar o microfone. Verifique as permissões.");
         return;
       }
 
       socket?.emit("voice:join", chId, async (res: { ok?: boolean; error?: string; peers?: string[] }) => {
         if (res.error) {
+          localStreamRef.current?.getTracks().forEach((track) => track.stop());
+          localStreamRef.current = null;
+          stopSpeakingDetector();
           setError(res.error);
           return;
         }
+
         setConnected(true);
-        // Nós somos o "novo" participante: iniciamos a oferta para cada peer já presente.
+        // createPeerConnection reserves the audio/camera/screen transceivers.
+        // Its negotiationneeded handler creates the initial offer. Keeping a
+        // single offer path prevents duplicate offers and signaling collisions.
         for (const peerUserId of res.peers ?? []) {
-          const pc = createPeerConnection(peerUserId, chId);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket?.emit("voice:signal", { to: peerUserId, from: myUserId, type: "offer", payload: offer, channelId: chId });
+          createPeerConnection(peerUserId, chId);
         }
       });
     },
-    [socket, myUserId, createPeerConnection, startSpeakingDetector]
+    [socket, createPeerConnection, startSpeakingDetector, stopSpeakingDetector]
   );
 
   const leave = useCallback(() => {
@@ -189,27 +308,59 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     setScreenSharing(false);
   }, [socket, stopSpeakingDetector]);
 
-  // ---- Sinalização recebida ----
   useEffect(() => {
     if (!socket) return;
 
     async function onSignal(data: { from: string; type: string; payload: unknown; channelId: string }) {
       if (data.channelId !== channelIdRef.current) return;
+
       let entry = peersRef.current.get(data.from);
+      if (!entry && data.type !== "offer") return;
 
       if (data.type === "offer") {
         const pc = entry?.pc ?? createPeerConnection(data.from, data.channelId);
-        await pc.setRemoteDescription(new RTCSessionDescription(data.payload as RTCSessionDescriptionInit));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket?.emit("voice:signal", { to: data.from, from: myUserId, type: "answer", payload: answer, channelId: data.channelId });
-      } else if (data.type === "answer") {
-        await entry?.pc.setRemoteDescription(new RTCSessionDescription(data.payload as RTCSessionDescriptionInit));
-      } else if (data.type === "ice-candidate") {
+        entry = peersRef.current.get(data.from)!;
+
+        const offerCollision = entry.makingOffer || pc.signalingState !== "stable";
+        entry.ignoreOffer = !entry.polite && offerCollision;
+        if (entry.ignoreOffer) return;
+
         try {
-          await entry?.pc.addIceCandidate(new RTCIceCandidate(data.payload as RTCIceCandidateInit));
-        } catch {
-          /* candidato pode chegar antes da remote description em raras corridas; ignorar */
+          entry.isSettingRemoteAnswerPending = false;
+          await pc.setRemoteDescription(new RTCSessionDescription(data.payload as RTCSessionDescriptionInit));
+          for (const candidate of entry.pendingCandidates.splice(0)) {
+            await pc.addIceCandidate(candidate).catch(() => {});
+          }
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          emitSignal(data.from, "answer", pc.localDescription, data.channelId);
+        } catch (err) {
+          console.error("WebRTC offer handling failed", err);
+        }
+      } else if (data.type === "answer") {
+        if (!entry) return;
+        try {
+          entry.isSettingRemoteAnswerPending = true;
+          await entry.pc.setRemoteDescription(new RTCSessionDescription(data.payload as RTCSessionDescriptionInit));
+          entry.isSettingRemoteAnswerPending = false;
+          for (const candidate of entry.pendingCandidates.splice(0)) {
+            await entry.pc.addIceCandidate(candidate).catch(() => {});
+          }
+        } catch (err) {
+          entry.isSettingRemoteAnswerPending = false;
+          console.error("WebRTC answer handling failed", err);
+        }
+      } else if (data.type === "ice-candidate") {
+        if (!entry) return;
+        const candidate = data.payload as RTCIceCandidateInit;
+        if (!entry.pc.remoteDescription) {
+          entry.pendingCandidates.push(candidate);
+          return;
+        }
+        try {
+          await entry.pc.addIceCandidate(candidate);
+        } catch (err) {
+          if (!entry.ignoreOffer) console.error("WebRTC ICE candidate failed", err);
         }
       }
     }
@@ -227,12 +378,18 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     function onMuteUpdate(data: { userId: string; muted: boolean }) {
       updateParticipant(data.userId, { muted: data.muted });
     }
+
     function onVideoUpdate(data: { userId: string; enabled: boolean }) {
       updateParticipant(data.userId, { videoEnabled: data.enabled });
     }
+
     function onScreenshareUpdate(data: { userId: string; sharing: boolean }) {
       updateParticipant(data.userId, { sharingScreen: data.sharing });
+      if (!data.sharing) {
+        updateParticipant(data.userId, { screenStream: undefined });
+      }
     }
+
     function onSpeakingUpdate(data: { userId: string; speaking: boolean }) {
       updateParticipant(data.userId, { speaking: data.speaking });
     }
@@ -254,7 +411,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       socket.off("voice:screenshare-update", onScreenshareUpdate);
       socket.off("voice:speaking-update", onSpeakingUpdate);
     };
-  }, [socket, myUserId, createPeerConnection, removePeer, updateParticipant]);
+  }, [socket, createPeerConnection, emitSignal, removePeer, updateParticipant]);
 
   const toggleMic = useCallback(() => {
     const stream = localStreamRef.current;
@@ -270,28 +427,30 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
   const toggleCamera = useCallback(async () => {
     const chId = channelIdRef.current;
     if (!chId) return;
+
     if (videoEnabled) {
-      const stream = localStreamRef.current;
-      const track = stream?.getVideoTracks()[0];
-      if (track) {
-        stream!.removeTrack(track);
+      localStreamRef.current?.getVideoTracks().forEach((track) => {
+        localStreamRef.current?.removeTrack(track);
         track.stop();
-        for (const [, entry] of peersRef.current) {
-          const sender = entry.pc.getSenders().find((s) => s.track?.kind === "video" && s.track.contentHint !== "detail");
-          if (sender) entry.pc.removeTrack(sender);
-        }
+      });
+
+      for (const entry of peersRef.current.values()) {
+        await entry.cameraTransceiver.sender.replaceTrack(null);
       }
       setVideoEnabled(false);
       socket?.emit("voice:video-toggle", { channelId: chId, enabled: false });
       return;
     }
+
     try {
       const camStream = await navigator.mediaDevices.getUserMedia({ video: true });
       const track = camStream.getVideoTracks()[0];
       localStreamRef.current?.addTrack(track);
-      for (const [, entry] of peersRef.current) {
-        entry.pc.addTrack(track, localStreamRef.current!);
+
+      for (const entry of peersRef.current.values()) {
+        await entry.cameraTransceiver.sender.replaceTrack(track);
       }
+
       setVideoEnabled(true);
       socket?.emit("voice:video-toggle", { channelId: chId, enabled: true });
     } catch {
@@ -299,43 +458,56 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     }
   }, [socket, videoEnabled]);
 
-  const toggleScreenShare = useCallback(async () => {
+  const stopScreenShare = useCallback(async () => {
     const chId = channelIdRef.current;
     if (!chId) return;
+
+    const track = screenStreamRef.current?.getVideoTracks()[0];
+    if (track) track.stop();
+
+    for (const entry of peersRef.current.values()) {
+      await entry.screenTransceiver.sender.replaceTrack(null);
+    }
+
+    screenStreamRef.current = null;
+    setScreenSharing(false);
+    socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
+  }, [socket]);
+
+  const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
-      screenStreamRef.current?.getTracks().forEach((t) => t.stop());
-      for (const [, entry] of peersRef.current) {
-        const sender = entry.pc.getSenders().find((s) => s.track?.contentHint === "detail");
-        if (sender) entry.pc.removeTrack(sender);
-      }
-      screenStreamRef.current = null;
-      setScreenSharing(false);
-      socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
+      await stopScreenShare();
       return;
     }
+
+    const chId = channelIdRef.current;
+    if (!chId) return;
+
     try {
-      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const display = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      });
       const track = display.getVideoTracks()[0];
       track.contentHint = "detail";
-      // Prefixo "screen-" no id do stream ajuda o outro lado a identificar a track no ontrack.
-      const screenStream = new MediaStream([track]);
-      Object.defineProperty(screenStream, "id", { value: `screen-${myUserId}-${Date.now()}` });
-      screenStreamRef.current = screenStream;
+      screenStreamRef.current = display;
 
-      for (const [, entry] of peersRef.current) {
-        entry.pc.addTrack(track, screenStream);
+      for (const entry of peersRef.current.values()) {
+        await entry.screenTransceiver.sender.replaceTrack(track);
       }
+
       track.onended = () => {
-        toggleScreenShare();
+        void stopScreenShare();
       };
+
       setScreenSharing(true);
       socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: true });
     } catch {
-      // usuário cancelou o picker do sistema — não é um erro real, ignorar
+      // Cancelar o seletor de tela não é um erro.
     }
-  }, [socket, screenSharing, myUserId]);
+  }, [socket, screenSharing, stopScreenShare]);
 
-  useEffect(() => () => leave(), []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => leave(), [leave]);
 
   return {
     connected,
