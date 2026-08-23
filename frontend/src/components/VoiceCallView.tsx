@@ -15,7 +15,7 @@ import {
 import { Channel } from "../types";
 import { Avatar } from "./Avatar";
 import { useAuth } from "../context/AuthContext";
-import { VoiceParticipant } from "../hooks/useVoiceCall";
+import { AudioDeviceOption, VoiceParticipant } from "../hooks/useVoiceCall";
 
 interface Props {
   channel: Channel;
@@ -31,6 +31,12 @@ interface Props {
   onLeave: () => void;
   localVideoStream: MediaStream | null;
   localScreenStream: MediaStream | null;
+  audioInputs: AudioDeviceOption[];
+  audioOutputs: AudioDeviceOption[];
+  selectedAudioInputId: string;
+  selectedAudioOutputId: string;
+  onSelectAudioInput: (deviceId: string) => void;
+  onSelectAudioOutput: (deviceId: string) => void;
 }
 
 export function VoiceCallView({
@@ -47,6 +53,12 @@ export function VoiceCallView({
   onLeave,
   localVideoStream,
   localScreenStream,
+  audioInputs,
+  audioOutputs,
+  selectedAudioInputId,
+  selectedAudioOutputId,
+  onSelectAudioInput,
+  onSelectAudioOutput,
 }: Props) {
   const { user } = useAuth();
   const list = Object.values(participants);
@@ -83,6 +95,7 @@ export function VoiceCallView({
       {error && <div className="bg-danger/15 text-danger text-sm px-4 py-2">{error}</div>}
 
       {audioPanelOpen && (
+        <section className="grid gap-4 px-5 py-4 border-b border-white/5 bg-bg-primary/40 animate-fade-in md:grid-cols-2" aria-label="Configurações de áudio">
         <section className="flex flex-wrap items-center gap-x-5 gap-y-3 px-5 py-3 border-b border-white/5 bg-bg-primary/40 animate-fade-in" aria-label="Configurações de áudio">
           <div className="flex items-center gap-2 text-sm text-text-primary">
             <Headphones size={16} className="text-text-muted" />
@@ -96,6 +109,7 @@ export function VoiceCallView({
             {outputMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
             {outputMuted ? "Áudio desativado" : "Áudio ativado"}
           </button>
+          <label className="flex items-center gap-3 text-xs text-text-muted min-w-[230px]">
           <label className="flex items-center gap-3 text-xs text-text-muted min-w-[230px] flex-1 max-w-sm">
             <span>Volume</span>
             <input
@@ -108,6 +122,20 @@ export function VoiceCallView({
               aria-label="Volume do áudio da chamada"
             />
             <span className="w-8 text-right tabular-nums">{outputVolume}%</span>
+          </label>
+          <label className="flex flex-col gap-1.5 text-xs text-text-muted">
+            <span>Dispositivo de entrada</span>
+            <select value={selectedAudioInputId} onChange={(event) => onSelectAudioInput(event.target.value)} className="h-9 rounded-md bg-bg-tertiary px-2.5 text-sm text-text-primary outline-none ring-brand focus:ring-2">
+              <option value="">Padrão do sistema</option>
+              {audioInputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1.5 text-xs text-text-muted">
+            <span>Dispositivo de saída</span>
+            <select value={selectedAudioOutputId} onChange={(event) => onSelectAudioOutput(event.target.value)} className="h-9 rounded-md bg-bg-tertiary px-2.5 text-sm text-text-primary outline-none ring-brand focus:ring-2">
+              <option value="">Padrão do sistema</option>
+              {audioOutputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+            </select>
           </label>
         </section>
       )}
@@ -133,6 +161,7 @@ export function VoiceCallView({
               audioStream={participant.stream}
               audioVolume={audioLevel}
               audioMuted={outputMuted}
+              audioOutputDeviceId={selectedAudioOutputId}
               isScreenShare={participant.sharingScreen}
             />
           ))}
@@ -174,6 +203,7 @@ function ParticipantTile({
   audioStream,
   audioVolume = 1,
   audioMuted = false,
+  audioOutputDeviceId,
   mirrored,
   isScreenShare,
 }: {
@@ -185,6 +215,7 @@ function ParticipantTile({
   audioStream?: MediaStream | null;
   audioVolume?: number;
   audioMuted?: boolean;
+  audioOutputDeviceId?: string;
   mirrored?: boolean;
   isScreenShare?: boolean;
 }) {
@@ -204,6 +235,12 @@ function ParticipantTile({
     audioRef.current.volume = audioVolume;
     audioRef.current.muted = audioMuted;
   }, [audioMuted, audioVolume]);
+
+  useEffect(() => {
+    const audio = audioRef.current as (HTMLAudioElement & { setSinkId?: (deviceId: string) => Promise<void> }) | null;
+    if (!audio?.setSinkId) return;
+    audio.setSinkId(audioOutputDeviceId || "default").catch(() => {});
+  }, [audioOutputDeviceId]);
 
   const audio = audioStream && <audio ref={audioRef} autoPlay />;
 
