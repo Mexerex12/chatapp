@@ -13,6 +13,11 @@ export interface VoiceParticipant {
   screenStream?: MediaStream;
 }
 
+export interface AudioDeviceOption {
+  deviceId: string;
+  label: string;
+}
+
 interface PeerEntry {
   pc: RTCPeerConnection;
   audioTransceiver: RTCRtpTransceiver;
@@ -27,6 +32,12 @@ interface PeerEntry {
   screenStream: MediaStream;
 }
 
+interface OutboundAudioProcessor {
+  ctx: AudioContext;
+  track: MediaStreamTrack;
+  microphoneGain: GainNode;
+}
+
 export function useVoiceCall(socket: Socket | null, channelId: string | null, _username: string, myUserId: string) {
   const [connected, setConnected] = useState(false);
   const [participants, setParticipants] = useState<Record<string, VoiceParticipant>>({});
@@ -35,12 +46,18 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
   const [screenSharing, setScreenSharing] = useState(false);
   const [localSpeaking, setLocalSpeaking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [audioInputs, setAudioInputs] = useState<AudioDeviceOption[]>([]);
+  const [audioOutputs, setAudioOutputs] = useState<AudioDeviceOption[]>([]);
+  const [selectedAudioInputId, setSelectedAudioInputId] = useState("");
+  const [selectedAudioOutputId, setSelectedAudioOutputId] = useState("");
+  const [microphoneGain, setMicrophoneGain] = useState(200);
 
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const peersRef = useRef<Map<string, PeerEntry>>(new Map());
   const iceServersRef = useRef<RTCIceServer[]>([{ urls: "stun:stun.l.google.com:19302" }]);
   const analyserRef = useRef<{ ctx: AudioContext; raf: number } | null>(null);
+  const outboundAudioProcessorRef = useRef<OutboundAudioProcessor | null>(null);
   const channelIdRef = useRef<string | null>(channelId);
   channelIdRef.current = channelId;
 
@@ -52,6 +69,23 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
       })
       .catch(() => {});
   }, []);
+
+  const refreshAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const toOption = (device: MediaDeviceInfo, index: number) => ({
+      deviceId: device.deviceId,
+      label: device.label || `${device.kind === "audioinput" ? "Microfone" : "Saída de áudio"} ${index + 1}`,
+    });
+    setAudioInputs(devices.filter((device) => device.kind === "audioinput").map(toOption));
+    setAudioOutputs(devices.filter((device) => device.kind === "audiooutput").map(toOption));
+  }, []);
+
+  useEffect(() => {
+    void refreshAudioDevices();
+    navigator.mediaDevices?.addEventListener("devicechange", refreshAudioDevices);
+    return () => navigator.mediaDevices?.removeEventListener("devicechange", refreshAudioDevices);
+  }, [refreshAudioDevices]);
 
   const updateParticipant = useCallback((userId: string, patch: Partial<VoiceParticipant>) => {
     setParticipants((prev) => ({
@@ -68,6 +102,32 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         ...patch,
       },
     }));
+  }, []);
+
+  const createOutboundAudioTrack = useCallback((microphoneTrack: MediaStreamTrack, screenAudioTrack?: MediaStreamTrack, gainPercent = microphoneGain) => {
+    outboundAudioProcessorRef.current?.ctx.close().catch(() => {});
+
+    const ctx = new AudioContext();
+    const destination = ctx.createMediaStreamDestination();
+    const microphoneSource = ctx.createMediaStreamSource(new MediaStream([microphoneTrack]));
+    const microphoneGain = ctx.createGain();
+    microphoneGain.gain.value = gainPercent / 100;
+    microphoneSource.connect(microphoneGain).connect(destination);
+
+    if (screenAudioTrack) {
+      const screenAudioSource = ctx.createMediaStreamSource(new MediaStream([screenAudioTrack]));
+      screenAudioSource.connect(destination);
+    }
+
+    const track = destination.stream.getAudioTracks()[0];
+    outboundAudioProcessorRef.current = { ctx, track, microphoneGain };
+    return track;
+  }, [microphoneGain]);
+
+  const replaceOutboundAudioTrack = useCallback(async (track: MediaStreamTrack | null) => {
+    for (const entry of peersRef.current.values()) {
+      await entry.audioTransceiver.sender.replaceTrack(track);
+    }
   }, []);
 
   const emitSignal = useCallback(
@@ -111,7 +171,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         screenStream: new MediaStream(),
       };
 
-      const localAudio = localStreamRef.current?.getAudioTracks()[0];
+      const localAudio = outboundAudioProcessorRef.current?.track ?? localStreamRef.current?.getAudioTracks()[0];
       const localCamera = localStreamRef.current?.getVideoTracks()[0];
       const localScreen = screenStreamRef.current?.getVideoTracks()[0];
 
@@ -129,23 +189,34 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         const track = event.track;
         const stream = event.streams[0];
 
-        if (event.transceiver.mid && event.transceiver.mid === entry.screenTransceiver.mid) {
-          if (!entry.screenStream.getTrackById(track.id)) entry.screenStream.addTrack(track);
+        // Compare transceiver objects first. MID values are assigned only after
+        // negotiation and can briefly be null while an incoming screen track is
+        // announced, which previously made the screen track look like camera
+        // media and left the viewer with an empty screen tile.
+        const isScreenTrack = event.transceiver === entry.screenTransceiver || (
+          event.transceiver.mid !== null && event.transceiver.mid === entry.screenTransceiver.mid
+        );
+        if (isScreenTrack) {
+          const screenStream = stream ?? entry.screenStream;
+          if (!stream && !screenStream.getTrackById(track.id)) screenStream.addTrack(track);
           updateParticipant(peerUserId, {
-            screenStream: entry.screenStream,
+            screenStream,
             sharingScreen: true,
           });
           track.onended = () => {
-            entry.screenStream.removeTrack(track);
+            screenStream.removeTrack(track);
             updateParticipant(peerUserId, {
-              screenStream: entry.screenStream.getVideoTracks().length ? entry.screenStream : undefined,
-              sharingScreen: entry.screenStream.getVideoTracks().length > 0,
+              screenStream: screenStream.getVideoTracks().length ? screenStream : undefined,
+              sharingScreen: screenStream.getVideoTracks().length > 0,
             });
           };
           return;
         }
 
-        if (event.transceiver.mid && event.transceiver.mid === entry.cameraTransceiver.mid) {
+        const isCameraTrack = event.transceiver === entry.cameraTransceiver || (
+          event.transceiver.mid !== null && event.transceiver.mid === entry.cameraTransceiver.mid
+        );
+        if (isCameraTrack) {
           if (stream) {
             updateParticipant(peerUserId, { stream });
           } else {
@@ -262,9 +333,16 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     async (chId: string) => {
       setError(null);
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        });
         localStreamRef.current = stream;
+        const microphoneTrack = stream.getAudioTracks()[0];
+        if (!microphoneTrack) throw new Error("Microfone não disponível");
+        createOutboundAudioTrack(microphoneTrack);
         startSpeakingDetector(stream, chId);
+        void refreshAudioDevices();
       } catch {
         setError("Não foi possível acessar o microfone. Verifique as permissões.");
         return;
@@ -288,8 +366,50 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         }
       });
     },
-    [socket, createPeerConnection, startSpeakingDetector, stopSpeakingDetector]
+    [socket, createOutboundAudioTrack, createPeerConnection, refreshAudioDevices, startSpeakingDetector, stopSpeakingDetector]
   );
+
+  const selectAudioInput = useCallback(async (deviceId: string) => {
+    const chId = channelIdRef.current;
+    if (!chId || deviceId === selectedAudioInputId) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      const nextTrack = stream.getAudioTracks()[0];
+      if (!nextTrack) throw new Error("Microfone não disponível");
+
+      nextTrack.enabled = !micMuted;
+      const currentStream = localStreamRef.current;
+      currentStream?.getAudioTracks().forEach((track) => {
+        currentStream.removeTrack(track);
+        track.stop();
+      });
+      currentStream?.addTrack(nextTrack);
+      const outboundTrack = createOutboundAudioTrack(nextTrack, screenStreamRef.current?.getAudioTracks()[0]);
+      await replaceOutboundAudioTrack(outboundTrack);
+      stopSpeakingDetector();
+      startSpeakingDetector(stream, chId);
+      setSelectedAudioInputId(deviceId);
+      setError(null);
+    } catch {
+      setError("Não foi possível trocar o microfone. Verifique as permissões do dispositivo.");
+    }
+  }, [createOutboundAudioTrack, micMuted, replaceOutboundAudioTrack, selectedAudioInputId, startSpeakingDetector, stopSpeakingDetector]);
+
+  const changeMicrophoneGain = useCallback(async (gainPercent: number) => {
+    const nextGain = Math.min(200, Math.max(100, gainPercent));
+    const processor = outboundAudioProcessorRef.current;
+    if (processor) processor.microphoneGain.gain.setTargetAtTime(nextGain / 100, processor.ctx.currentTime, 0.015);
+    setMicrophoneGain(nextGain);
+  }, []);
 
   const leave = useCallback(() => {
     const chId = channelIdRef.current;
@@ -298,6 +418,8 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     peersRef.current.clear();
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+    outboundAudioProcessorRef.current?.ctx.close().catch(() => {});
+    outboundAudioProcessorRef.current = null;
     localStreamRef.current = null;
     screenStreamRef.current = null;
     stopSpeakingDetector();
@@ -460,19 +582,25 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
 
   const stopScreenShare = useCallback(async () => {
     const chId = channelIdRef.current;
-    if (!chId) return;
+    const screenStream = screenStreamRef.current;
+    // Clear the reference before stopping the track. Calling track.stop() can
+    // synchronously run a browser's `ended` handler, which otherwise causes a
+    // second stop operation against a newly-created share.
+    screenStreamRef.current = null;
 
-    const track = screenStreamRef.current?.getVideoTracks()[0];
-    if (track) track.stop();
+    screenStream?.getTracks().forEach((track) => track.stop());
+
+    const microphoneTrack = localStreamRef.current?.getAudioTracks()[0];
+    const outboundTrack = microphoneTrack ? createOutboundAudioTrack(microphoneTrack) : null;
+    await replaceOutboundAudioTrack(outboundTrack);
 
     for (const entry of peersRef.current.values()) {
       await entry.screenTransceiver.sender.replaceTrack(null);
     }
 
-    screenStreamRef.current = null;
     setScreenSharing(false);
-    socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
-  }, [socket]);
+    if (chId) socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
+  }, [createOutboundAudioTrack, replaceOutboundAudioTrack, socket]);
 
   const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
@@ -486,11 +614,21 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     try {
       const display = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: false,
+        audio: true,
       });
       const track = display.getVideoTracks()[0];
+      if (!track) {
+        display.getTracks().forEach((mediaTrack) => mediaTrack.stop());
+        throw new Error("Nenhuma tela foi selecionada");
+      }
       track.contentHint = "detail";
       screenStreamRef.current = display;
+
+      const microphoneTrack = localStreamRef.current?.getAudioTracks()[0];
+      if (microphoneTrack) {
+        const outboundTrack = createOutboundAudioTrack(microphoneTrack, display.getAudioTracks()[0]);
+        await replaceOutboundAudioTrack(outboundTrack);
+      }
 
       for (const entry of peersRef.current.values()) {
         await entry.screenTransceiver.sender.replaceTrack(track);
@@ -505,7 +643,7 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     } catch {
       // Cancelar o seletor de tela não é um erro.
     }
-  }, [socket, screenSharing, stopScreenShare]);
+  }, [createOutboundAudioTrack, replaceOutboundAudioTrack, socket, screenSharing, stopScreenShare]);
 
   useEffect(() => () => leave(), [leave]);
 
@@ -523,5 +661,14 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     toggleScreenShare,
     error,
     localStream: localStreamRef,
+    localScreenStream: screenStreamRef,
+    audioInputs,
+    audioOutputs,
+    selectedAudioInputId,
+    selectedAudioOutputId,
+    microphoneGain,
+    selectAudioInput,
+    changeMicrophoneGain,
+    setSelectedAudioOutputId,
   };
 }
