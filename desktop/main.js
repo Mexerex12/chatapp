@@ -38,6 +38,7 @@ app.whenReady().then(() => {
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
       const sources = await desktopCapturer.getSources({ types: ["screen"] });
+      callback({ video: sources[0], audio: "loopback" });
       callback({ video: sources[0] });
     } catch {
       callback({});
