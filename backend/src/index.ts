@@ -13,6 +13,7 @@ import configRoutes from "./routes/config";
 import { initSocket } from "./sockets";
 
 const app = express();
+app.set("trust proxy", 1);
 const httpServer = http.createServer(app);
 
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
