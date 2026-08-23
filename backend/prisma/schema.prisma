@@ -3,7 +3,10 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  // Produção: Postgres (ex: Neon, Supabase, Railway Postgres).
+  // Para voltar a rodar 100% local sem serviço externo, troque para
+  // provider = "sqlite" e DATABASE_URL="file:./dev.db" no .env.
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 

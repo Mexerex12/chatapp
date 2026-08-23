@@ -52,17 +52,27 @@ cd ../desktop && npm install   # opcional, só se for usar o app desktop
 
 ## 3. Configurar o banco de dados
 
-O banco (SQLite) é criado automaticamente a partir do schema Prisma — não é preciso instalar nada além do Node.
+O schema Prisma já vem configurado para **Postgres** (necessário para hospedar de verdade e compartilhar com amigos — veja seção 12). Você tem duas opções:
 
-```bash
-cd backend
-cp .env.example .env
-# gere o client do Prisma e crie as tabelas:
-npx prisma generate
-npx prisma migrate dev --name init
-```
+### Opção A — Postgres na nuvem (recomendado, grátis)
+1. Crie um banco em [neon.tech](https://neon.tech) (ou [supabase.com](https://supabase.com)) — leva 1 minuto, sem cartão de crédito.
+2. Copie a *connection string* que eles fornecem.
+3. Configure:
+   ```bash
+   cd backend
+   cp .env.example .env
+   # edite o .env e cole a connection string em DATABASE_URL
+   npx prisma generate
+   npx prisma migrate dev --name init
+   ```
 
-Isso cria o arquivo `backend/prisma/dev.db` com todas as tabelas (User, Server, ServerMember, Channel, Message, Invite, FriendRequest, Friend).
+### Opção B — SQLite 100% local (sem depender de serviço externo)
+Só para testar rapidinho na sua máquina, sem publicar para ninguém:
+1. Em `backend/prisma/schema.prisma`, troque `provider = "postgresql"` para `provider = "sqlite"`.
+2. Em `backend/.env`, use `DATABASE_URL="file:./dev.db"`.
+3. Rode os mesmos comandos do passo acima (`prisma generate` e `prisma migrate dev`).
+
+Isso cria as tabelas (User, Server, ServerMember, Channel, Message, Invite, FriendRequest, Friend).
 
 > Quiser inspecionar o banco visualmente? Rode `npx prisma studio` dentro de `backend/`.
 
@@ -175,10 +185,72 @@ Se quiser testar em **dois computadores diferentes** na mesma rede (ou internet)
 - Notificações são apenas in-app (toasts), sem push do sistema operacional.
 - Reordenar canais por drag-and-drop ainda não está implementado (a posição existe no banco, falta a UI).
 
-## 12. Deploy (visão geral)
+## 12. Deploy — guia completo (Neon + Railway + Vercel)
 
-- **Backend**: qualquer host Node (Railway, Render, Fly.io, VPS próprio). Troque `DATABASE_URL` para Postgres em produção (o schema Prisma já modela tudo de forma portável) e ajuste `CORS_ORIGIN` para o domínio real do frontend.
-- **Frontend**: `npm run build` gera arquivos estáticos em `frontend/dist`, que podem ser hospedados em Vercel, Netlify, Cloudflare Pages ou qualquer CDN estática. Ajuste `VITE_API_URL` para a URL pública do backend.
-- **WebSocket**: garanta que o host do backend suporte conexões WebSocket persistentes (a maioria dos PaaS modernos suporta).
-- **TURN**: em produção, configure um TURN de verdade (seção 8) — sem ele, uma fração dos usuários (redes corporativas/CGNAT) não conseguirá conectar em chamadas.
-- **HTTPS**: obrigatório em produção — `getUserMedia`/`getDisplayMedia` só funcionam em contexto seguro (HTTPS ou `localhost`).
+O schema Prisma **já está configurado para Postgres** (`backend/prisma/schema.prisma`). Siga na ordem:
+
+### 12.1 Subir o código para o GitHub
+
+```bash
+cd chatapp
+git init
+git add .
+git commit -m "primeiro commit"
+```
+Crie um repositório vazio em [github.com/new](https://github.com/new) e depois:
+```bash
+git remote add origin https://github.com/SEU_USUARIO/chatapp.git
+git branch -M main
+git push -u origin main
+```
+
+### 12.2 Banco de dados — [Neon](https://neon.tech) (Postgres grátis)
+
+1. Crie conta, clique **Create Project**, escolha a região mais próxima.
+2. Em **Connection Details**, copie a **Connection string** (algo como `postgresql://usuario:senha@host/dbname?sslmode=require`).
+3. No seu computador, cole essa URL em `backend/.env` como `DATABASE_URL` e rode:
+   ```bash
+   cd backend
+   npx prisma migrate dev --name init
+   ```
+   Isso cria as tabelas direto no banco na nuvem — não precisa repetir isso no servidor depois.
+
+### 12.3 Backend — [Railway](https://railway.app)
+
+1. **New Project → Deploy from GitHub repo** → selecione seu repositório.
+2. Em **Settings → Root Directory**, defina `backend` (é um monorepo).
+3. Em **Variables**, adicione:
+   - `DATABASE_URL` — a mesma connection string do Neon
+   - `JWT_SECRET` — string aleatória forte (gere com `openssl rand -hex 32`)
+   - `JWT_EXPIRES_IN` = `7d`
+   - `CORS_ORIGIN` — por enquanto deixe `http://localhost:5173`, você volta aqui no passo 12.5
+   - `STUN_URLS` = `stun:stun.l.google.com:19302`
+   - **Não defina `PORT` manualmente** — o Railway injeta a porta automaticamente e o código já lê `process.env.PORT`.
+4. O Railway detecta o `package.json` e roda `npm install` (que já dispara `prisma generate` via `postinstall`), depois `npm run build` e `npm start` (que roda `prisma migrate deploy` automaticamente antes de iniciar — suas tabelas ficam sempre atualizadas a cada deploy).
+5. Depois do deploy, copie a URL pública gerada (ex: `https://seuapp.up.railway.app`) — em **Settings → Networking**, gere um domínio se ainda não tiver um.
+
+### 12.4 Frontend — [Vercel](https://vercel.com)
+
+1. Conecte seu GitHub e importe o mesmo repositório.
+2. Em **Root Directory**, selecione `frontend` (a Vercel detecta Vite automaticamente).
+3. Em **Environment Variables**, adicione `VITE_API_URL` = URL do Railway (passo anterior).
+4. Deploy. Você recebe uma URL tipo `https://seuapp.vercel.app` — **esse é o link para mandar aos seus amigos**.
+5. O arquivo `frontend/vercel.json` (já incluso) garante que rotas como `/login` não retornem 404 ao recarregar a página.
+
+### 12.5 Fechar o CORS
+
+Volte no Railway → Variables → edite `CORS_ORIGIN` para a URL exata da Vercel (ex: `https://seuapp.vercel.app`, sem barra no final) → redeploy o backend.
+
+### 12.6 TURN (recomendado para produção)
+
+Crie conta grátis em [Metered](https://www.metered.ca/tools/openrelay/) ou [Xirsys](https://xirsys.com), copie `TURN_URL`, `TURN_USERNAME` e `TURN_CREDENTIAL`, e adicione essas 3 variáveis no Railway. Sem isso, amigos em redes 4G ou corporativas restritas podem não conseguir conectar nas chamadas de voz/vídeo.
+
+### 12.7 Testar
+
+Mande o link da Vercel para seus amigos. Cada um cria a própria conta, você cria um servidor, gera um convite (Configurações do servidor → Gerar convite) e compartilha o código. HTTPS já vem pronto em ambas as plataformas — necessário para câmera/microfone/tela funcionarem.
+
+---
+
+### Alternativa: tudo em uma VPS só
+
+Se preferir não depender de 3 serviços, alugue uma VPS (ex: [Hetzner](https://www.hetzner.com) ~€4/mês) e rode backend + Postgres + frontend nela, com [Caddy](https://caddyserver.com) cuidando do HTTPS automático via domínio próprio. Isso é mais trabalho manual (SSH, systemd, etc.) mas evita múltiplos free tiers — se quiser, posso escrever esse guia à parte.
