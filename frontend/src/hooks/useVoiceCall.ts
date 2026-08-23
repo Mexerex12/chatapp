@@ -460,18 +460,20 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
 
   const stopScreenShare = useCallback(async () => {
     const chId = channelIdRef.current;
-    if (!chId) return;
+    const screenStream = screenStreamRef.current;
+    // Clear the reference before stopping the track. Calling track.stop() can
+    // synchronously run a browser's `ended` handler, which otherwise causes a
+    // second stop operation against a newly-created share.
+    screenStreamRef.current = null;
 
-    const track = screenStreamRef.current?.getVideoTracks()[0];
-    if (track) track.stop();
+    screenStream?.getTracks().forEach((track) => track.stop());
 
     for (const entry of peersRef.current.values()) {
       await entry.screenTransceiver.sender.replaceTrack(null);
     }
 
-    screenStreamRef.current = null;
     setScreenSharing(false);
-    socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
+    if (chId) socket?.emit("voice:screenshare-toggle", { channelId: chId, sharing: false });
   }, [socket]);
 
   const toggleScreenShare = useCallback(async () => {
@@ -489,6 +491,10 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         audio: false,
       });
       const track = display.getVideoTracks()[0];
+      if (!track) {
+        display.getTracks().forEach((mediaTrack) => mediaTrack.stop());
+        throw new Error("Nenhuma tela foi selecionada");
+      }
       track.contentHint = "detail";
       screenStreamRef.current = display;
 
@@ -523,5 +529,6 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
     toggleScreenShare,
     error,
     localStream: localStreamRef,
+    localScreenStream: screenStreamRef,
   };
 }
