@@ -189,23 +189,34 @@ export function useVoiceCall(socket: Socket | null, channelId: string | null, _u
         const track = event.track;
         const stream = event.streams[0];
 
-        if (event.transceiver.mid && event.transceiver.mid === entry.screenTransceiver.mid) {
-          if (!entry.screenStream.getTrackById(track.id)) entry.screenStream.addTrack(track);
+        // Compare transceiver objects first. MID values are assigned only after
+        // negotiation and can briefly be null while an incoming screen track is
+        // announced, which previously made the screen track look like camera
+        // media and left the viewer with an empty screen tile.
+        const isScreenTrack = event.transceiver === entry.screenTransceiver || (
+          event.transceiver.mid !== null && event.transceiver.mid === entry.screenTransceiver.mid
+        );
+        if (isScreenTrack) {
+          const screenStream = stream ?? entry.screenStream;
+          if (!stream && !screenStream.getTrackById(track.id)) screenStream.addTrack(track);
           updateParticipant(peerUserId, {
-            screenStream: entry.screenStream,
+            screenStream,
             sharingScreen: true,
           });
           track.onended = () => {
-            entry.screenStream.removeTrack(track);
+            screenStream.removeTrack(track);
             updateParticipant(peerUserId, {
-              screenStream: entry.screenStream.getVideoTracks().length ? entry.screenStream : undefined,
-              sharingScreen: entry.screenStream.getVideoTracks().length > 0,
+              screenStream: screenStream.getVideoTracks().length ? screenStream : undefined,
+              sharingScreen: screenStream.getVideoTracks().length > 0,
             });
           };
           return;
         }
 
-        if (event.transceiver.mid && event.transceiver.mid === entry.cameraTransceiver.mid) {
+        const isCameraTrack = event.transceiver === entry.cameraTransceiver || (
+          event.transceiver.mid !== null && event.transceiver.mid === entry.cameraTransceiver.mid
+        );
+        if (isCameraTrack) {
           if (stream) {
             updateParticipant(peerUserId, { stream });
           } else {
